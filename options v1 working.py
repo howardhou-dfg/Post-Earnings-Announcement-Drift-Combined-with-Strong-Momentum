@@ -1,0 +1,274 @@
+# https://quantpedia.com/strategies/post-earnings-announcement-drift-combined-with-strong-momentum/
+#
+# The investment universe consists of all stocks from NYSE, AMEX and NASDAQ with a price greater than $5. Each quarter, all stocks are
+# sorted into deciles based on their 12 months past performance. The investor then uses only stocks from the top momentum decile and
+# goes long on each stock 5 days before the earnings announcement and closes the long position at the close of the announcement day.
+# Subsequently, at the close of the announcement day, he/she goes short and he/she closes his short position on the 5th day after the
+# earnings announcement.
+#
+# QC Implementation:
+#   - Investment universe consist of stocks with earnings data available.
+
+from pandas.tseries.offsets import BDay
+from AlgorithmImports import *
+import data_tools
+
+
+class PostEarningsAnnouncement(QCAlgorithm):
+
+    def Initialize(self):
+        self.SetStartDate(2023, 2, 1)  # earnings days data starts in 2010
+        self.SetCash(100000)
+
+        self.quantile: int = 10
+
+        self.period: int = 12 * 21  # need n daily prices
+        self.rebalance_period: int = 3  # referes to months, which has to pass, before next portfolio rebalance
+
+        self.leverage: int = 1
+
+        self.data: dict[Symbol, data_tools.SymbolData] = {}
+        self.selected_symbols: list[Symbol] = []
+
+        # 50 equally weighted brackets for traded symbols
+        self.managed_symbols_size: int = 7
+        self.managed_symbols: list[data_tools.ManagedSymbol] = []
+
+        # earning data parsing
+        self.earnings: dict[datetime.date, list[str]] = {}
+        days_before_earnings: list[datetime.date] = []
+
+        # Empty dictionary for option contracts
+        self.option_contracts: dict[Symbol, Option] = {}
+
+        earnings_set: Set(str) = set()
+        earnings_data: str = self.Download('data.quantpedia.com/backtesting_data/economic/earnings_dates_eps.json')
+        earnings_data_json: list[dict] = json.loads(earnings_data)
+
+        for obj in earnings_data_json:
+            date: datetime.date = datetime.strptime(obj['date'], "%Y-%m-%d").date()
+
+            self.earnings[date] = []
+            days_before_earnings.append(date - BDay(5))
+
+            for stock_data in obj['stocks']:
+                ticker: str = stock_data['ticker']
+
+                self.earnings[date].append(ticker)
+                earnings_set.add(ticker)
+
+        self.earnings_universe: list[str] = list(earnings_set)
+
+        self.symbol: Symbol = self.AddEquity('SPY', Resolution.Daily).Symbol
+
+        # making data raw with these lines
+        equity = self.AddEquity('SPY', Resolution.Daily)
+        equity.SetDataNormalizationMode(DataNormalizationMode.Raw)
+        self.symbol = equity.Symbol
+
+        self.months_counter: int = 0
+        self.selection_flag: bool = False
+        self.UniverseSettings.Resolution = Resolution.Daily
+        self.AddUniverse(self.CoarseSelectionFunction)
+
+        # Events on earnings days, before and after earning days.
+        self.Schedule.On(self.DateRules.On(days_before_earnings), self.TimeRules.AfterMarketOpen(self.symbol),
+                         self.DaysBefore)
+        self.Schedule.On(self.DateRules.MonthStart(self.symbol), self.TimeRules.AfterMarketOpen(self.symbol),
+                         self.Selection)
+
+    def OnSecuritiesChanged(self, changes):
+        for security in changes.AddedSecurities:
+            security.SetDataNormalizationMode(DataNormalizationMode.Raw)
+            security.SetFeeModel(data_tools.CustomFeeModel())
+            security.SetLeverage(self.leverage)
+
+    def CoarseSelectionFunction(self, coarse):
+        # daily update of prices
+        for stock in coarse:
+            symbol: Symbol = stock.Symbol
+            if symbol is not None and symbol in self.data:
+                self.data[symbol].update(stock.AdjustedPrice)
+
+        if not self.selection_flag:
+            return Universe.Unchanged
+        self.selection_flag = False
+
+        selected: list[Symbol] = [x.Symbol for x in coarse if x.HasFundamentalData
+                                  and x.Market == 'usa' and x.Price > 5
+                                  and x.Symbol.Value in self.earnings_universe]
+
+        # warm up prices
+        for symbol in selected:
+            if symbol in self.data:
+                continue
+
+            self.data[symbol] = data_tools.SymbolData(self.period)
+            history = self.History(symbol, self.period, Resolution.Daily)
+
+            if history.empty:
+                self.Log(f"Not enough data for {symbol} yet")
+                continue
+
+            closes = history.loc[symbol].close
+            for _, close in closes.iteritems():
+                self.data[symbol].update(close)
+
+        # calculate momentum for each stock in self.earnings_universe
+        momentum: dict[Symbol, float] = {symbol: self.data[symbol].performance() for symbol in selected if
+                                         self.data[symbol].is_ready()}
+
+        if len(momentum) < self.quantile:
+            self.selected_symbols = []
+            return Universe.Unchanged
+
+        quantile: int = int(len(momentum) / self.quantile)
+        sorted_by_mom: list[Symbol] = [x[0] for x in sorted(momentum.items(), key=lambda item: item[1])]
+        # the investor uses only stocks from the top momentum quantile
+        self.selected_symbols = [symbol for symbol in sorted_by_mom[-quantile:] if symbol is not None]
+
+        return self.selected_symbols
+
+    def SelectOptionContract(self, underlying_symbol, expiry_date):
+        if underlying_symbol not in self.option_contracts:
+            # Add option for the underlying symbol
+            option = self.AddOption(underlying_symbol)
+            option.SetFilter(-1, 1, timedelta(0), timedelta(30))
+            self.option_contracts[underlying_symbol] = option
+
+        # get the option chain for the underlying_symbol
+        option_chain = self.OptionChainProvider.GetOptionContractList(underlying_symbol, self.Time)
+
+        # filter the option contracts based on the expiry date
+        contracts = [i for i in option_chain if
+                     i.ID.Date.date() >= expiry_date and i.ID.OptionRight == OptionRight.Call]
+
+        if len(contracts) == 0:
+            return None
+
+        # sort the contracts by their expiry date and pick the first one
+        contracts = sorted(contracts, key=lambda x: x.ID.Date.date())
+        return contracts[0]
+
+    def DaysBefore(self):
+        # every day check if 5 days from now is any earnings day
+        earnings_date: datetime.date = (self.Time + BDay(5)).date()
+        date_to_liquidate: datetime.date = (earnings_date + BDay(6)).date()
+
+        if earnings_date not in self.earnings:
+            return
+
+        for symbol in self.selected_symbols:
+
+            if symbol is None:
+                self.Debug("Symbol is None.")
+                continue
+
+            if symbol not in self.Securities:
+                self.Debug(f'Symbol {symbol} not found in Securities')
+                continue
+
+            ticker: str = symbol.Value
+
+            if ticker is None:
+                self.Debug("Ticker is None.")
+                continue
+
+            # is there any symbol which has earnings in 5 days
+            if ticker not in self.earnings[earnings_date]:
+                continue
+
+            if (len(self.managed_symbols) < self.managed_symbols_size) and not self.Securities[symbol].Invested and \
+                    self.Securities[symbol].Price != 0 and self.Securities[symbol].IsTradable:
+
+                # select the option contract
+                option_contract = self.SelectOptionContract(symbol, earnings_date)
+
+                if option_contract is None:
+                    self.Log(f"No valid option")
+                    continue
+
+                # NOTE: Must offset date to switch position by one day due to midnight execution of OnData function.
+                # Alternatively, there's is a possibility to switch to BeforeMarketClose function.
+                # log the details of the contract and the dates
+
+                ##For earnings date, have it be x.Expiry which is the expiration date
+
+                self.AddOptionContract(option_contract)
+
+                if option_contract is None or not self.Securities.ContainsKey(option_contract):
+                    self.Debug(f'Option contract {option_contract} not found in Securities')
+                    continue
+
+                buy_date: datetime.date = earnings_date - BDay(5)
+                contract = option_contract
+
+                if self.Securities.ContainsKey(option_contract):
+
+                    self.Schedule.On(self.DateRules.On(buy_date + timedelta(days=1)),
+                                     self.TimeRules.AfterMarketOpen(self.symbol),
+                                     Action(lambda contract=contract: self.MarketOrder(contract,
+                                                                                       1) if self.Securities.ContainsKey(
+                                         contract) else self.Debug(
+                                         'Option contract is None or not tradable at this time')))
+
+                    # self.MarketOrder(contract,1)
+
+                    # self.Schedule.On(self.DateRules.On(buy_date), self.TimeRules.At(0, 0),
+                    #             Action(lambda contract=contract: self.MarketOrder(contract, 1) if self.Securities.ContainsKey(contract) else self.Debug('Option contract is None or not tradable at this time')   ))
+
+
+                else:
+
+                    self.Debug(f"option not found e1")
+
+                if self.Securities.ContainsKey(option_contract):
+                    self.Schedule.On(self.DateRules.On(earnings_date), self.TimeRules.AfterMarketOpen(symbol, 90),
+                                     Action(lambda contract=contract: self.MarketOrder(contract,
+                                                                                       -1) if self.Securities.ContainsKey(
+                                         contract) else self.Debug(
+                                         'Option contract is None or not tradable at this time')))
+                else:
+                    self.Debug(f"option nout found e2")
+
+                # self.SetHoldings(option_contract, 1 / self.managed_symbols_size)
+
+                self.managed_symbols.append(
+                    data_tools.ManagedSymbol(symbol, earnings_date + BDay(1), date_to_liquidate))
+
+            else:
+                self.Log(f"No option contract found for symbol: {symbol.Value} on earnings date: {earnings_date}")
+
+    def OnData(self, data):
+        # switch positions on earnings days.
+        curr_date: datetime.date = self.Time.date()
+
+        managed_symbols_to_delete: list[data_tools.ManagedSymbol] = []
+        for managed_symbol in self.managed_symbols:
+            if managed_symbol.symbol is None:
+                self.Debug(f"Managed symbol {managed_symbol} is none")
+                continue
+            # elif managed_symbol.date_to_switch == curr_date:
+            #     self.Log(" ")
+            #     # switch position from long to short
+            #     ##self.SetHoldings(managed_symbol.symbol, -1 / self.managed_symbols_size)
+            #     ## sell long calls, and then next line go long puts
+
+            elif managed_symbol.date_to_liquidate <= curr_date:
+                ##self.Liquidate(managed_symbol.symbol)
+                managed_symbols_to_delete.append(managed_symbol)
+                # sell long puts
+
+        # remove symbols from management
+        for managed_symbol in managed_symbols_to_delete:
+            self.managed_symbols.remove(managed_symbol)
+
+    def Selection(self):
+        # quarter selection
+        if self.months_counter % self.rebalance_period == 0:
+            self.selection_flag = True
+        self.months_counter += 1
+
+    def OnOrderEvent(self, orderEvent):
+        if orderEvent.Status == OrderStatus.Filled:
+            self.Debug(f"{self.Time}: {orderEvent.Symbol} - Filled {orderEvent.FillQuantity} at {orderEvent.FillPrice}")
